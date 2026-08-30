@@ -1,6 +1,8 @@
 name: RTX 5090 FE Spain Watch
 
 on:
+  push:
+    branches: [main]
   schedule:
     # GitHub's scheduled workflows support a minimum cron interval of 5 minutes.
     # The Python process performs five checks 60 seconds apart inside each run,
