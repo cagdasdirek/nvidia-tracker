@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
-"""Advanced NVIDIA Spain RTX 5090 Founders Edition stock watcher.
+"""Smart NVIDIA Spain RTX 5090 Founders Edition watcher.
 
-Strategy:
-- Discover the current NVIDIA product SKU dynamically from the Marketplace product-search API.
-- Poll the FE inventory API using that live SKU.
-- Persist the last discovered SKU in a closed GitHub issue so changes survive Actions runs.
-- Treat SKU changes / empty inventory maps as early-warning signals, not as stock.
-- Use strict boolean parsing: NVIDIA commonly returns strings such as "true" / "false".
-- Never treat a mere product URL or an Add-to-Cart label as proof of stock.
-- Monitor source health because NVIDIA/Akamai can block datacenter monitoring with 403s.
-
-The GitHub workflow controls frequency. No purchase automation is performed.
+Goals:
+- Discover NVIDIA's current RTX 5090 SKU dynamically.
+- Treat FE inventory as the authoritative stock signal.
+- Poll adaptively instead of hammering a fixed interval.
+- Respect 429 Retry-After and back off hard on 403/5xx/network failures.
+- Automatically probe/recover after a cooldown (circuit breaker / auto-heal).
+- Use NVIDIA product-search + product page as independent health/SKU fallbacks.
+- Persist the last known SKU and recovery state in a closed GitHub issue.
+- Never rotate proxies, bypass CAPTCHAs, or try to defeat access controls.
 """
 
 from __future__ import annotations
@@ -24,7 +23,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 LOCALE = "es-es"
@@ -47,25 +47,27 @@ INVENTORY_BASE_URL = (
     "?status=1&locale=es-es&skus="
 )
 
-# Current product-page MPN observed in Spain plus historical FE identifiers.
-# These are only fallbacks if dynamic discovery is temporarily unavailable.
-FALLBACK_SKUS = [
-    "LCFEGF50LD90",
-    "5090LDLCFE",
-    "LDLC5090FE",
-    "NVGFT590",
-]
+FALLBACK_SKUS = ["LCFEGF50LD90", "5090LDLCFE", "LDLC5090FE", "NVGFT590"]
 
 STOCK_TITLE = "🚨 RTX 5090 FE IN STOCK — NVIDIA Spain"
 PREALERT_TITLE = "⚠️ RTX 5090 FE BACKEND CHANGE — CHECK NVIDIA NOW"
-HEALTH_TITLE = "🛠️ RTX 5090 tracker degraded — NVIDIA API blocked/failing"
+HEALTH_TITLE = "🛠️ RTX 5090 tracker degraded — NVIDIA API cooling down"
 STATE_TITLE = "🛰️ RTX 5090 tracker state (do not delete)"
+
+# Smart-poll defaults. Workflow env can override these without editing code.
+BASE_INTERVAL = int(os.environ.get("SMART_BASE_SECONDS", "45"))
+BASE_JITTER = int(os.environ.get("SMART_JITTER_SECONDS", "12"))
+STABLE_INTERVAL = int(os.environ.get("SMART_STABLE_SECONDS", "65"))
+STABLE_AFTER = int(os.environ.get("SMART_STABLE_AFTER", "8"))
+BURST_INTERVAL = int(os.environ.get("SMART_BURST_SECONDS", "24"))
+BURST_JITTER = int(os.environ.get("SMART_BURST_JITTER", "6"))
+BURST_CYCLES = int(os.environ.get("SMART_BURST_CYCLES", "8"))
+MAX_COOLDOWN = int(os.environ.get("SMART_MAX_COOLDOWN", "900"))
 
 BROWSER_UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"
 )
-
 NVIDIA_HEADERS = {
     "User-Agent": BROWSER_UA,
     "Accept": "application/json, text/javascript, */*; q=0.01",
@@ -78,7 +80,6 @@ NVIDIA_HEADERS = {
     "Sec-Fetch-Mode": "cors",
     "Sec-Fetch-Site": "same-site",
 }
-
 PAGE_HEADERS = {
     "User-Agent": BROWSER_UA,
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -88,8 +89,22 @@ PAGE_HEADERS = {
 }
 
 
+def now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return now().isoformat(timespec="seconds")
+
+
+def parse_iso(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
 
 
 def cache_bust(url: str) -> str:
@@ -98,7 +113,6 @@ def cache_bust(url: str) -> str:
 
 
 def strict_true(value: Any) -> bool:
-    """Parse NVIDIA booleans safely; string 'false' must never become True."""
     if value is True:
         return True
     if value is False or value is None:
@@ -110,16 +124,35 @@ def strict_true(value: Any) -> bool:
     return False
 
 
+def retry_after_seconds(headers: Any, default: int) -> int:
+    raw = None
+    try:
+        raw = headers.get("Retry-After") or headers.get("retry-after")
+    except Exception:
+        pass
+    if not raw:
+        return default
+    raw = str(raw).strip()
+    if raw.isdigit():
+        return max(default, int(raw))
+    try:
+        dt = parsedate_to_datetime(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return max(default, int((dt - now()).total_seconds()))
+    except Exception:
+        return default
+
+
 def request_raw(
     url: str,
     *,
     headers: dict[str, str],
     timeout: int = 12,
-    attempts: int = 2,
+    transient_retries: int = 1,
 ) -> tuple[int, bytes, dict[str, str]]:
-    """GET with conservative retries for transient errors, not anti-bot 403s."""
-    last_error: Exception | None = None
-    for attempt in range(attempts):
+    """Conservative GET. Never immediately retry 403/429."""
+    for attempt in range(transient_retries + 1):
         req = urllib.request.Request(url, headers=headers, method="GET")
         try:
             with urllib.request.urlopen(req, timeout=timeout) as response:
@@ -129,16 +162,16 @@ def request_raw(
                     {k.lower(): v for k, v in response.headers.items()},
                 )
         except urllib.error.HTTPError as exc:
-            # Retrying 403s usually just increases blocking. Retry only transient statuses.
-            if exc.code not in {429, 500, 502, 503, 504} or attempt == attempts - 1:
+            # 403/429 are explicit stop/backoff signals; retrying them is counterproductive.
+            if exc.code in {403, 429}:
                 raise
-            last_error = exc
-        except (urllib.error.URLError, TimeoutError) as exc:
-            last_error = exc
-            if attempt == attempts - 1:
+            if exc.code not in {500, 502, 503, 504} or attempt >= transient_retries:
                 raise
-        time.sleep(1.5 * (attempt + 1))
-    raise RuntimeError(f"request failed: {last_error!r}")
+        except (urllib.error.URLError, TimeoutError):
+            if attempt >= transient_retries:
+                raise
+        time.sleep(1.0 + random.random())
+    raise RuntimeError("request retry loop exhausted")
 
 
 def request_json(url: str, *, cachebuster: bool = True) -> Any:
@@ -148,7 +181,7 @@ def request_json(url: str, *, cachebuster: bool = True) -> Any:
 
 
 def request_text(url: str) -> str:
-    _, raw, _ = request_raw(cache_bust(url), headers=PAGE_HEADERS)
+    _, raw, _ = request_raw(cache_bust(url), headers=PAGE_HEADERS, transient_retries=0)
     return raw.decode("utf-8", errors="replace")
 
 
@@ -159,20 +192,25 @@ def normalize_upcs(value: Any) -> list[str]:
     return [str(x).strip() for x in values if str(x).strip()]
 
 
-def discover_product() -> tuple[dict[str, Any] | None, str | None]:
-    """Find the live RTX 5090 NVIDIA product and SKU from NVIDIA's search API."""
+def discover_product() -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     try:
         data = request_json(PRODUCT_SEARCH_URL)
+    except urllib.error.HTTPError as exc:
+        return None, {
+            "source": "product-search",
+            "http_status": exc.code,
+            "retry_after": retry_after_seconds(exc.headers, 120 if exc.code == 429 else 300),
+            "error": repr(exc),
+        }
     except Exception as exc:
-        return None, f"product-search request failed: {exc!r}"
+        return None, {"source": "product-search", "error": repr(exc)}
 
     try:
         products = data.get("searchedProducts", {}).get("productDetails", [])
     except AttributeError:
-        return None, "product-search returned unexpected JSON structure"
-
+        return None, {"source": "product-search", "error": "unexpected JSON structure"}
     if not isinstance(products, list):
-        return None, "productDetails is not a list"
+        return None, {"source": "product-search", "error": "productDetails is not a list"}
 
     candidates: list[dict[str, Any]] = []
     for product in products:
@@ -181,70 +219,64 @@ def discover_product() -> tuple[dict[str, Any] | None, str | None]:
         gpu = str(product.get("gpu", "")).strip().lower()
         manufacturer = str(product.get("manufacturer", "")).strip().lower()
         title = str(product.get("productTitle", "")).lower()
-
-        gpu_match = gpu in {"rtx 5090", "geforce rtx 5090"} or "rtx 5090" in title
-        nvidia_match = not manufacturer or manufacturer == "nvidia"
-        if gpu_match and nvidia_match:
+        if (gpu in {"rtx 5090", "geforce rtx 5090"} or "rtx 5090" in title) and (
+            not manufacturer or manufacturer == "nvidia"
+        ):
             candidates.append(product)
-
     if not candidates:
-        return None, "RTX 5090 NVIDIA product missing from product-search API"
+        return None, {"source": "product-search", "error": "RTX 5090 result missing"}
 
-    # Prefer an explicit NVIDIA/Founders Edition result when more than one appears.
     def score(p: dict[str, Any]) -> int:
-        blob = " ".join(
-            str(p.get(k, "")).lower()
-            for k in ("manufacturer", "productTitle", "productName", "productSKU")
-        )
-        return (
-            (5 if str(p.get("manufacturer", "")).lower() == "nvidia" else 0)
-            + (3 if "founders" in blob else 0)
-            + (2 if "5090" in str(p.get("productSKU", "")) else 0)
+        blob = " ".join(str(p.get(k, "")).lower() for k in ("manufacturer", "productTitle", "productName"))
+        return (5 if str(p.get("manufacturer", "")).lower() == "nvidia" else 0) + (
+            3 if "founders" in blob else 0
         )
 
     product = max(candidates, key=score)
     sku = str(product.get("productSKU", "")).strip()
     if not sku:
-        return None, "RTX 5090 product found but productSKU is empty"
-
+        return None, {"source": "product-search", "error": "productSKU empty"}
     retailers = product.get("retailers") if isinstance(product.get("retailers"), list) else []
     return {
         "sku": sku,
         "upcs": normalize_upcs(product.get("productUPC")),
-        "title": product.get("productTitle") or product.get("productName") or GPU_NAME,
         "retailers": retailers,
-        "raw": product,
+        "title": product.get("productTitle") or GPU_NAME,
     }, None
 
 
 def extract_page_mpn(page_html: str) -> str | None:
-    """Best-effort independent MPN discovery from NVIDIA's product detail page."""
     plain = html_lib.unescape(re.sub(r"<[^>]+>", " ", page_html))
     plain = re.sub(r"\s+", " ", plain)
-    patterns = [
+    for pattern in (
         r"\bMPN\s*:?\s*([A-Z0-9_-]{6,32})\b",
         r'"(?:mpn|productSKU)"\s*:\s*"([A-Za-z0-9_-]{6,32})"',
-    ]
-    for pattern in patterns:
+    ):
         match = re.search(pattern, plain, flags=re.IGNORECASE)
         if match:
             return match.group(1)
     return None
 
 
-def check_product_page() -> tuple[dict[str, Any] | None, str | None]:
+def check_product_page() -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     try:
         page = request_text(PRODUCT_PAGE_URL)
+    except urllib.error.HTTPError as exc:
+        return None, {
+            "source": "product-page",
+            "http_status": exc.code,
+            "retry_after": retry_after_seconds(exc.headers, 300),
+            "error": repr(exc),
+        }
     except Exception as exc:
-        return None, f"product page request failed: {exc!r}"
+        return None, {"source": "product-page", "error": repr(exc)}
 
-    plain_lower = html_lib.unescape(re.sub(r"<[^>]+>", " ", page)).lower()
+    plain = html_lib.unescape(re.sub(r"<[^>]+>", " ", page)).lower()
     return {
         "mpn": extract_page_mpn(page),
-        "mentions_5090": "rtx 5090" in plain_lower,
-        # These are only diagnostics. The button may exist while disabled/out of stock.
-        "has_cart_text": any(x in plain_lower for x in ("añadir al carrito", "comprar ahora")),
-        "has_oos_text": any(x in plain_lower for x in ("agotado", "producto agotado", "out of stock")),
+        "mentions_5090": "rtx 5090" in plain,
+        "has_cart_text": any(x in plain for x in ("añadir al carrito", "comprar ahora")),
+        "has_oos_text": any(x in plain for x in ("agotado", "producto agotado", "out of stock")),
     }, None
 
 
@@ -256,7 +288,13 @@ def check_inventory(sku: str) -> tuple[str, dict[str, Any]]:
     try:
         data = request_json(inventory_url(sku))
     except urllib.error.HTTPError as exc:
-        return "error", {"sku": sku, "http_status": exc.code, "error": repr(exc)}
+        default = 120 if exc.code == 429 else (300 if exc.code == 403 else 90)
+        return "error", {
+            "sku": sku,
+            "http_status": exc.code,
+            "retry_after": retry_after_seconds(exc.headers, default),
+            "error": repr(exc),
+        }
     except Exception as exc:
         return "error", {"sku": sku, "error": repr(exc)}
 
@@ -264,14 +302,11 @@ def check_inventory(sku: str) -> tuple[str, dict[str, Any]]:
         return "error", {"sku": sku, "error": "unexpected inventory JSON root"}
     if data.get("success") is False:
         return "error", {"sku": sku, "error": "inventory success=false", "response": data}
-
     entries = data.get("listMap")
     if isinstance(entries, dict):
         entries = [entries]
-    if entries is None:
-        return "error", {"sku": sku, "error": "listMap missing", "response": data}
-    if not isinstance(entries, list):
-        return "error", {"sku": sku, "error": "listMap malformed", "response": data}
+    if entries is None or not isinstance(entries, list):
+        return "error", {"sku": sku, "error": "listMap missing/malformed", "response": data}
     if not entries:
         return "empty", {"sku": sku, "entries": []}
 
@@ -284,36 +319,28 @@ def check_inventory(sku: str) -> tuple[str, dict[str, Any]]:
             stock = int(item.get("stock") or 0)
         except (TypeError, ValueError):
             stock = 0
-
-        # Strong stock evidence only. A product_url alone is NOT stock evidence.
         if active or available or stock > 0:
-            buy_url = (
-                item.get("product_url")
-                or item.get("directPurchaseLink")
-                or item.get("purchaseLink")
-                or MARKETPLACE_URL
-            )
             return "in_stock", {
                 "sku": sku,
                 "item": item,
-                "buy_url": buy_url,
+                "buy_url": item.get("product_url")
+                or item.get("directPurchaseLink")
+                or item.get("purchaseLink")
+                or MARKETPLACE_URL,
                 "active": active,
                 "available": available,
                 "stock": stock,
             }
-
     return "out_of_stock", {"sku": sku, "entries": entries}
 
 
-# ------------------------- GitHub state / alerts -------------------------
-
+# ---------------- GitHub state / alerts ----------------
 
 def github_request(method: str, path: str, payload: Any = None) -> Any:
     token = os.environ.get("GITHUB_TOKEN")
     repo = os.environ.get("GITHUB_REPOSITORY")
     if not token or not repo:
         raise RuntimeError("GITHUB_TOKEN/GITHUB_REPOSITORY unavailable")
-
     url = f"https://api.github.com/repos/{repo}{path}"
     headers = {
         "Authorization": f"Bearer {token}",
@@ -333,11 +360,10 @@ def github_request(method: str, path: str, payload: Any = None) -> Any:
 def all_issues() -> list[dict[str, Any]]:
     try:
         result = github_request("GET", "/issues?state=all&per_page=100")
-        if isinstance(result, list):
-            return [x for x in result if isinstance(x, dict) and "pull_request" not in x]
+        return [x for x in result if isinstance(x, dict) and "pull_request" not in x] if isinstance(result, list) else []
     except Exception as exc:
         print(f"[{now_iso()}] GitHub issue lookup failed: {exc!r}", flush=True)
-    return []
+        return []
 
 
 def find_issue(title: str, *, open_only: bool = False) -> dict[str, Any] | None:
@@ -354,39 +380,32 @@ def create_issue(title: str, body: str, *, notify_owner: bool = True) -> int | N
         payload["assignees"] = [owner]
     try:
         created = github_request("POST", "/issues", payload)
-        number = created.get("number") if isinstance(created, dict) else None
-        print(f"[{now_iso()}] Created issue #{number}: {title}", flush=True)
-        return number
+        return created.get("number") if isinstance(created, dict) else None
     except Exception as exc:
-        print(f"[{now_iso()}] Could not create issue '{title}': {exc!r}", flush=True)
+        print(f"[{now_iso()}] Could not create issue {title!r}: {exc!r}", flush=True)
         return None
 
 
 def ensure_alert_issue(title: str, body: str) -> int | None:
     existing = find_issue(title, open_only=True)
-    if existing:
-        return existing.get("number")
-    return create_issue(title, body, notify_owner=True)
+    return existing.get("number") if existing else create_issue(title, body, notify_owner=True)
 
 
 def close_alert_issue(title: str) -> None:
     issue = find_issue(title, open_only=True)
     if not issue:
         return
-    number = issue.get("number")
     try:
-        github_request("PATCH", f"/issues/{number}", {"state": "closed"})
-        print(f"[{now_iso()}] Closed issue #{number}: {title}", flush=True)
+        github_request("PATCH", f"/issues/{issue.get('number')}", {"state": "closed"})
     except Exception as exc:
-        print(f"[{now_iso()}] Could not close issue #{number}: {exc!r}", flush=True)
+        print(f"[{now_iso()}] Could not close {title!r}: {exc!r}", flush=True)
 
 
 def load_state() -> dict[str, Any]:
     issue = find_issue(STATE_TITLE)
     if not issue:
         return {}
-    body = issue.get("body") or ""
-    match = re.search(r"```json\s*(\{.*?\})\s*```", body, flags=re.DOTALL)
+    match = re.search(r"```json\s*(\{.*?\})\s*```", issue.get("body") or "", flags=re.DOTALL)
     if not match:
         return {}
     try:
@@ -397,8 +416,7 @@ def load_state() -> dict[str, Any]:
 
 
 def save_state(state: dict[str, Any]) -> None:
-    body = (
-        "Internal state for the RTX 5090 watcher. This issue is intentionally closed.\n\n"
+    body = "Internal state for the RTX 5090 watcher. This issue is intentionally closed.\n\n" + (
         f"```json\n{json.dumps(state, ensure_ascii=False, indent=2)}\n```"
     )
     issue = find_issue(STATE_TITLE)
@@ -408,180 +426,219 @@ def save_state(state: dict[str, Any]) -> None:
             if number:
                 github_request("PATCH", f"/issues/{number}", {"state": "closed"})
         else:
-            number = issue.get("number")
-            github_request("PATCH", f"/issues/{number}", {"body": body, "state": "closed"})
+            github_request("PATCH", f"/issues/{issue.get('number')}", {"body": body, "state": "closed"})
     except Exception as exc:
-        print(f"[{now_iso()}] Could not persist tracker state: {exc!r}", flush=True)
+        print(f"[{now_iso()}] State persistence failed: {exc!r}", flush=True)
 
 
 def backend_change_alert(reason: str, details: dict[str, Any]) -> None:
     owner = os.environ.get("GITHUB_REPOSITORY_OWNER", "cagdasdirek")
-    body = (
-        f"@{owner} **NVIDIA Spain changed something in the RTX 5090 FE backend.**\n\n"
-        "This is **not proof that stock is live**, but SKU/backend changes have preceded FE drops, "
-        "so open NVIDIA immediately.\n\n"
-        f"# 👉 CHECK NVIDIA NOW: {MARKETPLACE_URL}\n\n"
-        f"Reason: **{reason}**\n\n"
-        f"Detected: `{now_iso()}`\n\n"
-        f"```json\n{json.dumps(details, ensure_ascii=False, indent=2)[:5000]}\n```"
+    ensure_alert_issue(
+        PREALERT_TITLE,
+        f"@{owner} **NVIDIA Spain RTX 5090 FE backend changed.**\n\n"
+        "This is not proof of stock, but it can be a drop precursor.\n\n"
+        f"# 👉 CHECK NVIDIA NOW: {MARKETPLACE_URL}\n\nReason: **{reason}**\n\n"
+        f"Detected: `{now_iso()}`\n\n```json\n{json.dumps(details, ensure_ascii=False, indent=2)[:5000]}\n```",
     )
-    ensure_alert_issue(PREALERT_TITLE, body)
 
 
 def stock_alert(info: dict[str, Any]) -> None:
     owner = os.environ.get("GITHUB_REPOSITORY_OWNER", "cagdasdirek")
     buy_url = info.get("buy_url") or MARKETPLACE_URL
-    item = info.get("item") or {}
-    body = (
-        f"@{owner} **RTX 5090 Founders Edition is reported IN STOCK by NVIDIA's inventory API.**\n\n"
-        f"# 👉 BUY NOW: {buy_url}\n\n"
-        f"NVIDIA Spain fallback: {MARKETPLACE_URL}\n\n"
-        f"Detected: `{now_iso()}`\n"
-        f"SKU: `{info.get('sku', '')}`\n\n"
-        f"```json\n{json.dumps(item, ensure_ascii=False, indent=2)[:5000]}\n```"
+    ensure_alert_issue(
+        STOCK_TITLE,
+        f"@{owner} **RTX 5090 Founders Edition is IN STOCK according to NVIDIA inventory.**\n\n"
+        f"# 👉 BUY NOW: {buy_url}\n\nFallback: {MARKETPLACE_URL}\n\n"
+        f"Detected: `{now_iso()}`\nSKU: `{info.get('sku', '')}`\n\n"
+        f"```json\n{json.dumps(info.get('item') or {}, ensure_ascii=False, indent=2)[:5000]}\n```",
     )
-    ensure_alert_issue(STOCK_TITLE, body)
     close_alert_issue(PREALERT_TITLE)
     close_alert_issue(HEALTH_TITLE)
 
 
 def health_alert(details: dict[str, Any]) -> None:
     owner = os.environ.get("GITHUB_REPOSITORY_OWNER", "cagdasdirek")
-    body = (
-        f"@{owner} The watcher has repeatedly failed to reach NVIDIA's inventory source. "
-        "Akamai/NVIDIA may be blocking the GitHub runner, so stock detection is temporarily degraded.\n\n"
-        f"Manual check: {MARKETPLACE_URL}\n\n"
-        f"Detected: `{now_iso()}`\n\n"
-        f"```json\n{json.dumps(details, ensure_ascii=False, indent=2)[:5000]}\n```"
+    ensure_alert_issue(
+        HEALTH_TITLE,
+        f"@{owner} The NVIDIA inventory source is temporarily failing or rate-limiting. "
+        "The watcher has entered **safe cooldown mode** and will auto-probe/recover.\n\n"
+        f"Manual check: {MARKETPLACE_URL}\n\nDetected: `{now_iso()}`\n\n"
+        f"```json\n{json.dumps(details, ensure_ascii=False, indent=2)[:5000]}\n```",
     )
-    ensure_alert_issue(HEALTH_TITLE, body)
 
 
-# ------------------------------ Main loop ------------------------------
+# ---------------- Smart interval / auto-heal ----------------
+
+def bounded_jitter(base: int, spread: int) -> int:
+    return max(15, base + random.randint(-spread, spread))
+
+
+def error_cooldown(error_streak: int, info: dict[str, Any]) -> int:
+    explicit = int(info.get("retry_after") or 0)
+    status = info.get("http_status")
+    if status == 403:
+        base = 300
+    elif status == 429:
+        base = 120
+    else:
+        base = 45
+    exponential = base * (2 ** max(0, error_streak - 1))
+    return min(MAX_COOLDOWN, max(explicit, exponential))
+
+
+def mode_interval(*, burst_left: int, stable_oos: int) -> int:
+    if burst_left > 0:
+        return bounded_jitter(BURST_INTERVAL, BURST_JITTER)
+    if stable_oos >= STABLE_AFTER:
+        return bounded_jitter(STABLE_INTERVAL, BASE_JITTER)
+    return bounded_jitter(BASE_INTERVAL, BASE_JITTER)
 
 
 def main() -> None:
-    checks = max(1, int(os.environ.get("CHECKS_PER_RUN", "5")))
-    interval = max(20, int(os.environ.get("CHECK_INTERVAL_SECONDS", "60")))
-    discovery_every = max(1, int(os.environ.get("DISCOVERY_EVERY_CHECKS", "1")))
-    page_every = max(1, int(os.environ.get("PAGE_EVERY_CHECKS", "2")))
+    checks = max(1, int(os.environ.get("CHECKS_PER_RUN", "7")))
+    discovery_every = max(1, int(os.environ.get("DISCOVERY_EVERY_CHECKS", "3")))
+    page_every = max(1, int(os.environ.get("PAGE_EVERY_CHECKS", "7")))
 
     state = load_state()
     current_sku = str(state.get("sku") or "").strip() or FALLBACK_SKUS[0]
     current_upcs = normalize_upcs(state.get("upcs"))
-
-    inventory_errors = 0
-    empty_inventory_streak = 0
-    discovery_errors = 0
+    error_streak = int(state.get("inventory_error_streak") or 0)
+    stable_oos = int(state.get("stable_oos") or 0)
+    burst_left = int(state.get("burst_left") or 0)
+    cooldown_until = parse_iso(state.get("cooldown_until"))
+    dirty = False
 
     print(f"Marketplace: {MARKETPLACE_URL}", flush=True)
     print(f"Starting SKU: {current_sku}", flush=True)
 
     for index in range(checks):
         cycle = index + 1
-        print(f"\n[{now_iso()}] ===== cycle {cycle}/{checks} =====", flush=True)
+        print(f"\n[{now_iso()}] ===== smart cycle {cycle}/{checks} =====", flush=True)
 
-        # 1) Dynamic product/SKU discovery. This is the key defense against stale hardcoded SKUs.
+        # Circuit breaker: while cooling down, do not hammer inventory. Probe only when due.
+        if cooldown_until and now() < cooldown_until:
+            remaining = int((cooldown_until - now()).total_seconds())
+            print(f"[{now_iso()}] SAFE COOLDOWN: {remaining}s remaining", flush=True)
+            if index == 0 or index % page_every == 0:
+                page_info, page_error = check_product_page()
+                print(f"[{now_iso()}] fallback page: {page_info or page_error}", flush=True)
+            sleep_for = min(max(20, remaining), 90)
+            if index < checks - 1:
+                time.sleep(sleep_for)
+            continue
+
+        # SKU discovery is deliberately slower than inventory polling.
         if index % discovery_every == 0:
             product, discovery_error = discover_product()
             if product:
-                discovery_errors = 0
                 discovered_sku = product["sku"]
                 discovered_upcs = product.get("upcs", [])
-                print(
-                    f"[{now_iso()}] discovery OK: sku={discovered_sku} upcs={discovered_upcs}",
-                    flush=True,
-                )
-
                 previous_sku = str(state.get("sku") or "").strip()
+                print(f"[{now_iso()}] discovery OK: sku={discovered_sku} upcs={discovered_upcs}", flush=True)
                 if previous_sku and discovered_sku != previous_sku:
                     backend_change_alert(
                         "Product-search SKU changed",
                         {"old_sku": previous_sku, "new_sku": discovered_sku, "upcs": discovered_upcs},
                     )
-
+                    burst_left = BURST_CYCLES
+                    stable_oos = 0
                 current_sku = discovered_sku
                 current_upcs = discovered_upcs
                 if previous_sku != discovered_sku or state.get("upcs") != discovered_upcs:
-                    state = {
-                        "sku": discovered_sku,
-                        "upcs": discovered_upcs,
-                        "last_discovered": now_iso(),
-                    }
-                    save_state(state)
+                    state["sku"] = discovered_sku
+                    state["upcs"] = discovered_upcs
+                    state["last_discovered"] = now_iso()
+                    dirty = True
             else:
-                discovery_errors += 1
-                print(f"[{now_iso()}] discovery ERROR: {discovery_error}", flush=True)
+                print(f"[{now_iso()}] discovery degraded: {discovery_error}", flush=True)
 
-        # 2) Inventory is the authoritative stock signal.
         inv_state, inv_info = check_inventory(current_sku)
-        print(
-            f"[{now_iso()}] inventory {current_sku}: {inv_state} | "
-            f"{json.dumps(inv_info, ensure_ascii=False)[:1800]}",
-            flush=True,
-        )
+        print(f"[{now_iso()}] inventory: {inv_state} | {json.dumps(inv_info, ensure_ascii=False)[:1800]}", flush=True)
 
         if inv_state == "in_stock":
-            inventory_errors = 0
-            empty_inventory_streak = 0
+            error_streak = 0
+            stable_oos = 0
+            cooldown_until = None
+            burst_left = BURST_CYCLES
             stock_alert(inv_info)
+            close_alert_issue(HEALTH_TITLE)
         elif inv_state == "out_of_stock":
-            inventory_errors = 0
-            empty_inventory_streak = 0
+            if error_streak:
+                print(f"[{now_iso()}] AUTO-HEAL: inventory recovered after {error_streak} errors", flush=True)
+            error_streak = 0
+            cooldown_until = None
+            stable_oos += 1
             close_alert_issue(STOCK_TITLE)
             close_alert_issue(HEALTH_TITLE)
         elif inv_state == "empty":
-            inventory_errors = 0
-            empty_inventory_streak += 1
-            # Empty listMap has historically been a useful SKU-change/drop precursor.
-            # Require two observations to avoid alerting on a one-off CDN hiccup.
-            if empty_inventory_streak >= 2:
-                backend_change_alert(
-                    "Inventory listMap stayed empty for the current SKU",
-                    {"sku": current_sku, "streak": empty_inventory_streak},
-                )
+            error_streak = 0
+            stable_oos = 0
+            burst_left = max(burst_left, BURST_CYCLES)
+            backend_change_alert("Inventory listMap is empty for current live SKU", inv_info)
         else:
-            inventory_errors += 1
-            empty_inventory_streak = 0
-            if inventory_errors >= 4:
-                health_alert(
-                    {
-                        "inventory_error_streak": inventory_errors,
-                        "discovery_error_streak": discovery_errors,
-                        "current_sku": current_sku,
-                        "last_inventory": inv_info,
-                    }
-                )
+            stable_oos = 0
+            error_streak += 1
+            cooldown = error_cooldown(error_streak, inv_info)
+            cooldown_until = now() + timedelta(seconds=cooldown)
+            print(
+                f"[{now_iso()}] CIRCUIT OPEN: status={inv_info.get('http_status')} "
+                f"streak={error_streak}; cooldown={cooldown}s",
+                flush=True,
+            )
+            health_alert(
+                {
+                    "inventory_error_streak": error_streak,
+                    "cooldown_seconds": cooldown,
+                    "cooldown_until": cooldown_until.isoformat(timespec="seconds"),
+                    "current_sku": current_sku,
+                    "last_inventory_error": inv_info,
+                }
+            )
 
-        # 3) Independent product-page observation. Never use the cart label alone as stock proof.
+        # Lightweight independent page health/MPN check, intentionally infrequent.
         if index % page_every == 0:
             page_info, page_error = check_product_page()
+            print(f"[{now_iso()}] product page: {page_info or page_error}", flush=True)
             if page_info:
-                print(f"[{now_iso()}] product page: {page_info}", flush=True)
                 page_mpn = str(page_info.get("mpn") or "").strip()
-                previous_sku = str(state.get("sku") or "").strip()
-                # Only use page MPN as a backend-change alert when dynamic discovery is failing;
-                # otherwise product-search API remains the source of truth for SKU.
-                if discovery_errors >= 2 and page_mpn and previous_sku and page_mpn != previous_sku:
+                known = str(state.get("sku") or current_sku).strip()
+                if page_mpn and known and page_mpn != known:
                     backend_change_alert(
-                        "Product-page MPN changed while search API is unavailable",
-                        {"old_sku": previous_sku, "page_mpn": page_mpn},
+                        "Product-page MPN differs from last known SKU",
+                        {"known_sku": known, "page_mpn": page_mpn},
                     )
-            else:
-                print(f"[{now_iso()}] product page ERROR: {page_error}", flush=True)
+                    burst_left = max(burst_left, BURST_CYCLES)
 
-        # When everything is healthy and clearly OOS, reset the pre-alert only after several
-        # normal cycles so a short backend-change signal remains visible long enough to notice.
-        if (
-            inv_state == "out_of_stock"
-            and discovery_errors == 0
-            and cycle >= 4
-            and empty_inventory_streak == 0
-        ):
-            close_alert_issue(PREALERT_TITLE)
+        if burst_left > 0:
+            burst_left -= 1
+
+        state.update(
+            {
+                "sku": current_sku,
+                "upcs": current_upcs,
+                "inventory_error_streak": error_streak,
+                "stable_oos": stable_oos,
+                "burst_left": burst_left,
+                "cooldown_until": cooldown_until.isoformat(timespec="seconds") if cooldown_until else None,
+                "last_cycle": now_iso(),
+            }
+        )
+        dirty = True
 
         if index < checks - 1:
+            interval = mode_interval(burst_left=burst_left, stable_oos=stable_oos)
+            # If we just opened the circuit, next cycle waits at least the cooldown slice.
+            if cooldown_until:
+                interval = min(max(interval, 60), max(60, int((cooldown_until - now()).total_seconds())))
+            print(
+                f"[{now_iso()}] next check in {interval}s "
+                f"(burst_left={burst_left}, stable_oos={stable_oos}, errors={error_streak})",
+                flush=True,
+            )
             time.sleep(interval)
+
+    if dirty:
+        save_state(state)
 
 
 if __name__ == "__main__":
