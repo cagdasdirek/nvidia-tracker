@@ -1,6 +1,8 @@
 name: RTX 5090 FE Spain Watch
 
 on:
+  push:
+    branches: [main]
   schedule:
     # GitHub cron is only a watchdog. It can be delayed under load, so the
     # workflow also self-dispatches at the end of every run for near-continuous
