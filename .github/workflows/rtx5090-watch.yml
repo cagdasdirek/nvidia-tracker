@@ -1,12 +1,10 @@
 name: RTX 5090 FE Spain Watch
 
 on:
-  push:
-    branches: [main]
   schedule:
-    # GitHub's scheduled workflows support a minimum cron interval of 5 minutes.
-    # The Python process performs five checks 60 seconds apart inside each run,
-    # giving approximately one NVIDIA stock check per minute.
+    # GitHub schedules start at 5-minute granularity. Each run stays alive and
+    # performs ten inventory checks 30 seconds apart, so NVIDIA inventory is
+    # sampled roughly twice per minute without requiring a PC or paid server.
     - cron: "*/5 * * * *"
   workflow_dispatch:
 
@@ -21,15 +19,19 @@ concurrency:
 jobs:
   watch:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 7
     env:
-      CHECKS_PER_RUN: "5"
-      CHECK_INTERVAL_SECONDS: "60"
+      CHECKS_PER_RUN: "10"
+      CHECK_INTERVAL_SECONDS: "30"
+      # Refresh dynamic SKU/product metadata every 2 cycles = about once/minute.
+      DISCOVERY_EVERY_CHECKS: "2"
+      # Cross-check the NVIDIA product page every 2 cycles = about once/minute.
+      PAGE_EVERY_CHECKS: "2"
     steps:
       - name: Checkout tracker
         uses: actions/checkout@v4
 
-      - name: Check NVIDIA Spain every minute
+      - name: Watch NVIDIA Spain RTX 5090 FE
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python3 tracker.py
