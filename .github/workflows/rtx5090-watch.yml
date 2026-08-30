@@ -21,28 +21,34 @@ concurrency:
 jobs:
   watch:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     env:
       # A run stays alive for several adaptive checks, then hands off to a
-      # replacement run. Python chooses the actual delay each cycle.
+      # replacement run. adaptive_runner.py chooses the actual delay each cycle.
       CHECKS_PER_RUN: "7"
 
-      # Normal OOS: broad jitter window rather than a near-periodic cadence.
-      # Current implementation samples around 55s with +/-25s jitter: ~30-80s.
-      SMART_BASE_SECONDS: "55"
-      SMART_JITTER_SECONDS: "25"
-
-      # After a long stable OOS period, reduce load further: ~55-105s.
-      SMART_STABLE_SECONDS: "80"
+      # Core tracker state transitions.
       SMART_STABLE_AFTER: "8"
-
-      # Backend/SKU signal: temporarily faster, but still non-periodic: ~18-42s.
-      SMART_BURST_SECONDS: "30"
-      SMART_BURST_JITTER: "12"
       SMART_BURST_CYCLES: "8"
-
-      # 403/429/errors: exponential circuit-breaker cooldown, capped at 15 min.
       SMART_MAX_COOLDOWN: "900"
+
+      # Non-periodic load-smoothed timing windows.
+      # Ordinary OOS: bounded right-skewed samples, roughly 28-95s.
+      TIMING_NORMAL_MIN: "28"
+      TIMING_NORMAL_MAX: "95"
+
+      # Long stable OOS: reduce load further.
+      TIMING_STABLE_MIN: "50"
+      TIMING_STABLE_MAX: "130"
+
+      # Backend/SKU signal: temporarily faster, but still non-periodic.
+      TIMING_BURST_MIN: "18"
+      TIMING_BURST_MAX: "48"
+
+      # Rare longer idle only during ordinary/stable OOS; never during burst.
+      TIMING_IDLE_CHANCE: "0.08"
+      TIMING_IDLE_MULT_MIN: "1.35"
+      TIMING_IDLE_MULT_MAX: "1.90"
 
       # Product-search is lighter than page HTML and keeps SKU fresh.
       DISCOVERY_EVERY_CHECKS: "3"
@@ -55,7 +61,7 @@ jobs:
       - name: Watch NVIDIA Spain RTX 5090 FE
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: python3 tracker.py
+        run: python3 adaptive_runner.py
 
       - name: Start replacement watcher
         if: always()
