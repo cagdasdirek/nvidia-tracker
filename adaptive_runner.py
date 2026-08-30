@@ -5,6 +5,11 @@ This module deliberately keeps a single, consistent HTTP identity. It only
 changes the *timing policy* used by tracker.py so requests are load-smoothed
 rather than clock-like. It does not rotate fingerprints, proxies, cookies, or
 other identifiers.
+
+It also adds a strict purchase gate around tracker.py: a stock alert is only
+allowed when NVIDIA inventory exposes both a positive availability signal and
+an explicit HTTP(S) purchase URL. A bare product listing or stale cart text is
+not sufficient.
 """
 
 from __future__ import annotations
@@ -101,7 +106,77 @@ def nonperiodic_interval(*, burst_left: int, stable_oos: int) -> int:
     return fresh
 
 
+# Strict purchase gate: tracker.py's base detector intentionally treats any
+# positive inventory bit as "in_stock". For notifications we require a real
+# purchase destination as well, so an indexed button or backend-only signal
+# cannot produce a false stock alert.
+_original_check_inventory = tracker.check_inventory
+
+
+def strict_check_inventory(sku: str):
+    state, info = _original_check_inventory(sku)
+    if state != "in_stock":
+        return state, info
+
+    item = info.get("item") if isinstance(info, dict) else None
+    item = item if isinstance(item, dict) else {}
+    purchase_url = next(
+        (
+            str(item.get(key) or "").strip()
+            for key in ("product_url", "directPurchaseLink", "purchaseLink")
+            if str(item.get(key) or "").strip().lower().startswith(("http://", "https://"))
+        ),
+        "",
+    )
+
+    if not purchase_url:
+        return "out_of_stock", {
+            "sku": sku,
+            "entries": [item],
+            "strict_reason": "positive inventory signal without an explicit purchasable URL",
+        }
+
+    info["buy_url"] = purchase_url
+    info["strict_purchase_verified"] = True
+    return "in_stock", info
+
+
+# GitHub mobile notifications can depend on client settings. The real stock
+# path therefore creates/assigns the issue as before and, only on first creation,
+# adds a second @mention comment to generate an additional notification event.
+_original_stock_alert = tracker.stock_alert
+
+
+def reinforced_stock_alert(info: dict) -> None:
+    existed = tracker.find_issue(tracker.STOCK_TITLE, open_only=True)
+    _original_stock_alert(info)
+    if existed:
+        return
+
+    created = tracker.find_issue(tracker.STOCK_TITLE, open_only=True)
+    if not created:
+        return
+
+    owner = os.environ.get("GITHUB_REPOSITORY_OWNER", "cagdasdirek")
+    number = created.get("number")
+    try:
+        tracker.github_request(
+            "POST",
+            f"/issues/{number}/comments",
+            {
+                "body": (
+                    f"@{owner} 🚨 **SECOND ALERT: verified RTX 5090 FE purchase link is live.**\n\n"
+                    f"BUY NOW: {info.get('buy_url')}"
+                )
+            },
+        )
+    except Exception as exc:
+        print(f"[{tracker.now_iso()}] Secondary GitHub mention failed: {exc!r}", flush=True)
+
+
 tracker.mode_interval = nonperiodic_interval
+tracker.check_inventory = strict_check_inventory
+tracker.stock_alert = reinforced_stock_alert
 
 if __name__ == "__main__":
     tracker.main()
