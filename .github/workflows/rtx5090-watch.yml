@@ -4,10 +4,8 @@ on:
   push:
     branches: [main]
   schedule:
-    # GitHub cron is only a watchdog. It can be delayed under load, so the
-    # workflow also self-dispatches at the end of every run for near-continuous
-    # coverage. Offset from :00 because GitHub documents higher schedule load
-    # around the start of the hour.
+    # Cron is only a watchdog. The active watcher self-dispatches a replacement.
+    # Offset from :00 to reduce GitHub scheduler contention.
     - cron: "2-57/5 * * * *"
   workflow_dispatch:
 
@@ -17,28 +15,35 @@ permissions:
   actions: write
 
 concurrency:
-  # At most one live watcher plus one queued replacement. A cron watchdog and
-  # self-dispatch may race; concurrency prevents duplicate polling jobs.
   group: rtx-5090-fe-spain-watch
   cancel-in-progress: false
 
 jobs:
   watch:
     runs-on: ubuntu-latest
-    timeout-minutes: 7
+    timeout-minutes: 10
     env:
-      # Ten inventory checks 30 seconds apart = ~4.5 minutes of live polling.
-      # A replacement workflow is dispatched immediately afterward.
-      CHECKS_PER_RUN: "10"
-      CHECK_INTERVAL_SECONDS: "30"
+      # A run stays alive for several smart/adaptive checks, then hands off to a
+      # replacement run. The Python code chooses the actual delay each cycle.
+      CHECKS_PER_RUN: "7"
 
-      # Refresh NVIDIA's product-search API once per minute so a SKU rotation
-      # immediately becomes the SKU used by the inventory poller.
-      DISCOVERY_EVERY_CHECKS: "2"
+      # Normal OOS: ~45s +/- jitter. After long stable OOS, slow down a little.
+      SMART_BASE_SECONDS: "45"
+      SMART_JITTER_SECONDS: "12"
+      SMART_STABLE_SECONDS: "65"
+      SMART_STABLE_AFTER: "8"
 
-      # The product HTML is a heavier/less authoritative fallback; inspect it
-      # once per run while the APIs do the fast path.
-      PAGE_EVERY_CHECKS: "10"
+      # Backend/SKU signal: temporary faster polling, still jittered.
+      SMART_BURST_SECONDS: "24"
+      SMART_BURST_JITTER: "6"
+      SMART_BURST_CYCLES: "8"
+
+      # 403/429/errors: exponential circuit-breaker cooldown, capped at 15 min.
+      SMART_MAX_COOLDOWN: "900"
+
+      # Product-search is lighter than page HTML and keeps SKU fresh.
+      DISCOVERY_EVERY_CHECKS: "3"
+      PAGE_EVERY_CHECKS: "7"
 
     steps:
       - name: Checkout tracker
