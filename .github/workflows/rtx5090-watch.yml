@@ -23,19 +23,22 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
-      # A run stays alive for several smart/adaptive checks, then hands off to a
-      # replacement run. The Python code chooses the actual delay each cycle.
+      # A run stays alive for several adaptive checks, then hands off to a
+      # replacement run. Python chooses the actual delay each cycle.
       CHECKS_PER_RUN: "7"
 
-      # Normal OOS: ~45s +/- jitter. After long stable OOS, slow down a little.
-      SMART_BASE_SECONDS: "45"
-      SMART_JITTER_SECONDS: "12"
-      SMART_STABLE_SECONDS: "65"
+      # Normal OOS: broad jitter window rather than a near-periodic cadence.
+      # Current implementation samples around 55s with +/-25s jitter: ~30-80s.
+      SMART_BASE_SECONDS: "55"
+      SMART_JITTER_SECONDS: "25"
+
+      # After a long stable OOS period, reduce load further: ~55-105s.
+      SMART_STABLE_SECONDS: "80"
       SMART_STABLE_AFTER: "8"
 
-      # Backend/SKU signal: temporary faster polling, still jittered.
-      SMART_BURST_SECONDS: "24"
-      SMART_BURST_JITTER: "6"
+      # Backend/SKU signal: temporarily faster, but still non-periodic: ~18-42s.
+      SMART_BURST_SECONDS: "30"
+      SMART_BURST_JITTER: "12"
       SMART_BURST_CYCLES: "8"
 
       # 403/429/errors: exponential circuit-breaker cooldown, capped at 15 min.
