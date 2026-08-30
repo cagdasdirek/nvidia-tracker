@@ -2,10 +2,10 @@ name: RTX 5090 FE Spain Watch
 
 on:
   schedule:
-    # GitHub schedules start at 5-minute granularity. Each run stays alive and
-    # performs ten inventory checks 30 seconds apart, so NVIDIA inventory is
-    # sampled roughly twice per minute without requiring a PC or paid server.
-    - cron: "*/5 * * * *"
+    # GitHub schedules have 5-minute minimum granularity. Offset by two minutes
+    # from the top of the hour, where GitHub documents higher schedule load.
+    # Each run stays alive and performs ten inventory checks 30 seconds apart.
+    - cron: "2-57/5 * * * *"
   workflow_dispatch:
 
 permissions:
