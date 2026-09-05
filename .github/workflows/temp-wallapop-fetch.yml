@@ -49,7 +49,7 @@ jobs:
           items_by_id={}
           raw={}
           for q in queries:
-              params={'step':1,'source':'keywords','limit':40,'keywords':q}
+              params={'step':1,'source':'keywords','limit':40,'keywords':q,'latitude':40.4168,'longitude':-3.7038,'distance':800000}
               url=base+'?'+urllib.parse.urlencode(params)
               try:
                   txt=subprocess.check_output([
