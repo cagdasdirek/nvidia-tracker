@@ -76,7 +76,7 @@ jobs:
           PY
 
           i=1
-          while IFS= read -r url; do
+          while IFS= read -r url || [ -n "$url" ]; do
             [ -z "$url" ] && continue
             echo "Downloading image $i"
             curl --fail --show-error --location "$url" -o "out/image_$i.jpg"
