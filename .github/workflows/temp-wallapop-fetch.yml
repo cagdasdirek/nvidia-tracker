@@ -1,132 +1,65 @@
-name: Temp Wallapop CRT Sweep
+name: Temp Wallapop Pro CRT Deep Search
 on:
   push:
     branches:
       - temp-wallapop-fetch
-
 jobs:
-  sweep:
+  search:
     runs-on: ubuntu-latest
     steps:
-      - name: Search Wallapop CRT listings
+      - name: Search pro CRT models
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p out/images
-          cat > /tmp/sweep.py <<'PY'
-          import json, subprocess, urllib.parse, pathlib, time, re, os
-
-          queries = [
-              "sony pvm",
-              "sony bvm",
-              "pvm 20",
-              "pvm 14",
-              "20l4",
-              "20m4e",
-              "20m4",
-              "20n6e",
-              "20n6",
-              "20n5e",
-              "14l4",
-              "14m4e",
-              "14n6e",
-              "14n6",
-              "pvm trinitron",
-              "monitor profesional sony",
-              "monitor video sony",
-              "sony trinitron profesional",
-              "monitor broadcast sony",
-              "monitor crt profesional sony",
-              "commodore 1084",
-              "1084s",
-              "philips cm8833",
-              "cm8833",
-              "monitor amiga",
-              "monitor commodore",
+          cat > /tmp/deep.py <<'PY'
+          import json, subprocess, urllib.parse, re, time
+          queries=[
+            "PVM 2054QM","PVM 2010QM","PVM 2030","PVM 2044QM","PVM 2130QM","PVM 2730QM","PVM 2950QM",
+            "PVM 20M2E","PVM 20M4E","PVM 20L2","PVM 20L4","PVM 20L5","PVM 20N6E","PVM 20N5E",
+            "PVM 1454QM","PVM 1444QM","PVM 14M2E","PVM 14M4E","PVM 14L2","PVM 14L4","PVM 14N6E",
+            "BVM 20F1E","BVM D20F1E","BVM 20","Sony Cube monitor",
+            "JVC TM-H1750CG","JVC TM-H1950CG","JVC TM-H150CG","JVC TM-H1700G","JVC broadcast monitor CRT",
+            "Ikegami HTM CRT","Ikegami monitor CRT","Barco monitor CRT","Panasonic BT-H CRT",
+            "Sony KV-29LS30E","Sony KV-29X5E","Sony KV-29FX30E","Sony KV-25 Trinitron RGB",
+            "Commodore 1084S","Philips CM8833"
           ]
-
           base='https://api.wallapop.com/api/v3/search'
-          items_by_id={}
-          raw={}
+          seen={}
           for q in queries:
-              params={'step':1,'source':'keywords','limit':40,'keywords':q,'latitude':40.4168,'longitude':-3.7038,'distance':800000}
-              url=base+'?'+urllib.parse.urlencode(params)
-              try:
-                  txt=subprocess.check_output([
-                      'curl','--fail','--silent','--show-error','--location',
-                      '-H','Host: api.wallapop.com','-H','X-DeviceOS: 0',url
-                  ], text=True)
-                  d=json.loads(txt)
-              except Exception as e:
-                  raw[q]={'error':str(e)}
-                  continue
-              raw[q]=d
-              arr=((((d.get('data') or {}).get('section') or {}).get('payload') or {}).get('items') or [])
-              for it in arr:
-                  iid=it.get('id')
-                  if not iid: continue
-                  rec=items_by_id.setdefault(iid,it.copy())
-                  rec.setdefault('_queries',[])
-                  if q not in rec['_queries']: rec['_queries'].append(q)
-              time.sleep(0.05)
-
-          def score(it):
-              s=0
-              t=((it.get('title') or '')+' '+(it.get('description') or '')).lower()
-              rules=[
-                (r'\b20l5\b',120),(r'\b20l4\b',115),(r'\b20m4e?\b',110),(r'\b20n6e?\b',95),
-                (r'\b20n5e?\b',75),(r'\b14l4\b',80),(r'\b14m4e?\b',78),(r'\b14n6e?\b',72),
-                (r'\bbvm[- ]?20',105),(r'\bpvm[- ]?20',90),(r'\bpvm[- ]?14',65),
-                (r'\b1084s\b',70),(r'\b1084\b',60),(r'\bcm8833',65),
-                (r'\bpvm\b',35),(r'\bbvm\b',35),(r'profesional',10),(r'broadcast',10),(r'trinitron',5)
-              ]
-              for pat,val in rules:
-                  if re.search(pat,t): s=max(s,val) if val>=60 else s+val
-              price=((it.get('price') or {}).get('amount') or 9999)
-              if s>=90 and price<=700: s+=25
-              if s>=70 and price<=400: s+=15
-              if price<=250: s+=5
-              return s
-
-          items=list(items_by_id.values())
-          for it in items:
-              it['_score']=score(it)
-          items.sort(key=lambda x:(x['_score'], -((x.get('price') or {}).get('amount') or 9999)), reverse=True)
-
-          pathlib.Path('out/results.json').write_text(json.dumps(items,ensure_ascii=False,indent=2))
-          pathlib.Path('out/raw.json').write_text(json.dumps(raw,ensure_ascii=False))
-
-          print("UNIQUE_ITEMS",len(items))
-          for idx,it in enumerate(items[:50],1):
-              print("ROW",idx,
-                    "SCORE",it['_score'],
-                    "PRICE",(it.get('price') or {}).get('amount'),
-                    "CITY",(it.get('location') or {}).get('city'),
-                    "TITLE",it.get('title'),
-                    "SLUG",it.get('web_slug'),
-                    "QUERIES",','.join(it.get('_queries',[])))
-
-          # Download first image for top 30 for visual inspection
-          for idx,it in enumerate(items[:30],1):
-              imgs=it.get('images') or []
-              if not imgs: continue
-              u=((imgs[0].get('urls') or {}).get('big') or (imgs[0].get('urls') or {}).get('medium'))
-              if not u: continue
-              fn=f"out/images/{idx:02d}_{it.get('id')}.jpg"
-              subprocess.run(['curl','--fail','--silent','--show-error','--location',u,'-o',fn],check=False)
-
-          # simple TSV
-          with open('out/results.tsv','w',encoding='utf-8') as fh:
-              fh.write("score\tprice\tcity\ttitle\tslug\tqueries\n")
-              for it in items:
-                  fh.write(f"{it['_score']}\t{(it.get('price') or {}).get('amount')}\t{(it.get('location') or {}).get('city')}\t{(it.get('title') or '').replace(chr(9),' ')}\t{it.get('web_slug')}\t{','.join(it.get('_queries',[]))}\n")
+            params={'step':1,'source':'keywords','limit':40,'keywords':q,'latitude':40.4168,'longitude':-3.7038,'distance':800000}
+            url=base+'?'+urllib.parse.urlencode(params)
+            try:
+              txt=subprocess.check_output(['curl','--fail','--silent','--show-error','--location','-H','Host: api.wallapop.com','-H','X-DeviceOS: 0',url],text=True)
+              d=json.loads(txt)
+            except Exception:
+              continue
+            arr=((((d.get('data') or {}).get('section') or {}).get('payload') or {}).get('items') or [])
+            for it in arr:
+              if (it.get('location') or {}).get('country_code')!='ES': continue
+              iid=it.get('id')
+              if not iid: continue
+              r=seen.setdefault(iid,it.copy())
+              r.setdefault('_queries',[])
+              if q not in r['_queries']: r['_queries'].append(q)
+            time.sleep(.05)
+          # likely monitors only
+          out=[]
+          for it in seen.values():
+            t=((it.get('title') or '')+' '+(it.get('description') or '')).lower()
+            if any(x in t for x in ['pvm','bvm','tm-h','ikegami','barco','bt-h','trinitron','1084','cm8833','broadcast']):
+              title=(it.get('title') or '').lower()
+              if not any(x in title for x in ['manual','cable','tarjeta','botonera','poster','funko','adaptador','batería','bateria']):
+                out.append(it)
+          out.sort(key=lambda x:((x.get('price') or {}).get('amount') or 99999))
+          print('COUNT',len(out))
+          for n,it in enumerate(out,1):
+            print('ITEM',n,'PRICE',(it.get('price') or {}).get('amount'),'CITY',(it.get('location') or {}).get('city'),
+                  'TITLE',it.get('title'),'SLUG',it.get('web_slug'),'Q',','.join(it.get('_queries',[])))
+          open('deep.json','w').write(json.dumps(out,ensure_ascii=False,indent=2))
           PY
-          python3 /tmp/sweep.py
-          tar -czf wallapop-crt-sweep.tgz -C out .
-
-      - name: Upload sweep
-        uses: actions/upload-artifact@v4
+          python3 /tmp/deep.py
+          tar -czf deep.tgz deep.json
+      - uses: actions/upload-artifact@v4
         with:
-          name: wallapop-crt-sweep
-          path: wallapop-crt-sweep.tgz
-          if-no-files-found: error
+          name: wallapop-deep-search
+          path: deep.tgz
