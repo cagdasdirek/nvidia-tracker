@@ -8,63 +8,68 @@ jobs:
   fetch:
     runs-on: ubuntu-latest
     steps:
-      - name: Fetch Wallapop item and images
+      - name: Search Wallapop and fetch exact listing images
         shell: bash
         run: |
           set -euxo pipefail
           mkdir -p out
 
-          API='https://api.wallapop.com/api/v3/items/1119238065'
-          PAGE='https://es.wallapop.com/item/monitor-sony-vintage-1119238065'
+          Q='Monitor Sony Triniton profesional Vintage'
+          URL='https://api.wallapop.com/api/v3/search'
 
-          echo '--- trying API ---'
-          if curl --fail --show-error --location \
-            -H 'Accept: application/json, text/plain, */*' \
-            -H 'Origin: https://es.wallapop.com' \
-            -H 'Referer: https://es.wallapop.com/' \
-            -H 'User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36' \
-            -H 'X-DeviceOS: 0' \
-            "$API" -o out/item.json; then
-            echo 'API_OK=1'
-          else
-            echo 'API_OK=0'
-          fi
-
-          if [ ! -s out/item.json ]; then
-            echo '--- trying SSR page ---'
-            curl --fail --show-error --location \
-              -H 'User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36' \
-              "$PAGE" -o out/page.html || true
-            python3 - <<'PY'
-          import json,re,html,pathlib
-          p=pathlib.Path('out/page.html')
-          if p.exists():
-              s=p.read_text(errors='ignore')
-              m=re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', s)
-              if m:
-                  data=json.loads(html.unescape(m.group(1)))
-                  item=data.get('props',{}).get('pageProps',{}).get('item')
-                  if item:
-                      pathlib.Path('out/item.json').write_text(json.dumps(item))
+          python3 - <<'PY' > /tmp/query.txt
+          import urllib.parse
+          print(urllib.parse.urlencode({
+              'step':1,
+              'source':'keywords',
+              'limit':40,
+              'keywords':'Monitor Sony Triniton profesional Vintage',
+              'min_sale_price':250,
+              'max_sale_price':280,
+              'latitude':41.6488,
+              'longitude':-0.8891,
+              'distance':200000,
+          }))
           PY
-          fi
+          QS="$(cat /tmp/query.txt)"
+
+          echo "SEARCH_URL=$URL?$QS"
+          curl --show-error --location \
+            -H 'Host: api.wallapop.com' \
+            -H 'X-DeviceOS: 0' \
+            "$URL?$QS" -o out/search.json -w '\nHTTP=%{http_code}\n'
+
+          echo '--- response head ---'
+          head -c 2000 out/search.json || true
+          echo
 
           python3 - <<'PY'
-          import json, pathlib
-          p=pathlib.Path('out/item.json')
-          if not p.exists() or not p.stat().st_size:
-              raise SystemExit('NO_ITEM_JSON')
+          import json, pathlib, sys
+          p=pathlib.Path('out/search.json')
           d=json.loads(p.read_text())
-          print('TITLE:', d.get('title'))
-          print('DESCRIPTION:', d.get('description'))
-          print('PRICE:', d.get('price'))
-          imgs=d.get('images') or []
+          items = (((d.get('data') or {}).get('section') or {}).get('payload') or {}).get('items') or []
+          print('ITEM_COUNT:', len(items))
+          target=None
+          for it in items:
+              print('CANDIDATE:', it.get('id'), it.get('title'), it.get('price'), it.get('location'), it.get('web_slug'))
+              if it.get('web_slug') == 'monitor-sony-vintage-1119238065':
+                  target=it
+                  break
+              title=(it.get('title') or '').lower()
+              if 'triniton' in title and 'profesional' in title and (it.get('price') or {}).get('amount') == 269:
+                  target=it
+          if not target:
+              raise SystemExit('TARGET_NOT_FOUND')
+          pathlib.Path('out/target.json').write_text(json.dumps(target, ensure_ascii=False, indent=2))
+          print('TARGET_ID:', target.get('id'))
+          print('TARGET_TITLE:', target.get('title'))
+          print('TARGET_DESC:', target.get('description'))
+          print('TARGET_PRICE:', target.get('price'))
+          imgs=target.get('images') or []
           print('IMAGE_COUNT:', len(imgs))
           urls=[]
           for n,img in enumerate(imgs,1):
-              u=((img.get('urls') or {}).get('big') or
-                 (img.get('urls') or {}).get('medium') or
-                 (img.get('urls') or {}).get('small'))
+              u=((img.get('urls') or {}).get('big') or (img.get('urls') or {}).get('medium') or (img.get('urls') or {}).get('small'))
               print(f'IMAGE_{n}: {u}')
               if u: urls.append(u)
           pathlib.Path('out/image_urls.txt').write_text('\n'.join(urls))
@@ -73,18 +78,12 @@ jobs:
           i=1
           while IFS= read -r url; do
             [ -z "$url" ] && continue
-            ext=".jpg"
-            case "$url" in
-              *.png*) ext=".png" ;;
-              *.webp*) ext=".webp" ;;
-              *.jpeg*) ext=".jpeg" ;;
-            esac
-            echo "Downloading image $i: $url"
-            curl --fail --show-error --location "$url" -o "out/image_$i$ext"
+            echo "Downloading image $i"
+            curl --fail --show-error --location "$url" -o "out/image_$i.jpg"
+            file "out/image_$i.jpg" || true
             i=$((i+1))
           done < out/image_urls.txt
 
-          echo '--- files ---'
           ls -lah out
           tar -czf wallapop-images.tgz -C out .
 
