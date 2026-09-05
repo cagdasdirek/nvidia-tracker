@@ -1,95 +1,132 @@
-name: Temp Wallapop Fetch
+name: Temp Wallapop CRT Sweep
 on:
   push:
     branches:
       - temp-wallapop-fetch
 
 jobs:
-  fetch:
+  sweep:
     runs-on: ubuntu-latest
     steps:
-      - name: Search Wallapop and fetch exact listing images
+      - name: Search Wallapop CRT listings
         shell: bash
         run: |
-          set -euxo pipefail
-          mkdir -p out
+          set -euo pipefail
+          mkdir -p out/images
+          cat > /tmp/sweep.py <<'PY'
+          import json, subprocess, urllib.parse, pathlib, time, re, os
 
-          Q='Monitor Sony Triniton profesional Vintage'
-          URL='https://api.wallapop.com/api/v3/search'
+          queries = [
+              "sony pvm",
+              "sony bvm",
+              "pvm 20",
+              "pvm 14",
+              "20l4",
+              "20m4e",
+              "20m4",
+              "20n6e",
+              "20n6",
+              "20n5e",
+              "14l4",
+              "14m4e",
+              "14n6e",
+              "14n6",
+              "pvm trinitron",
+              "monitor profesional sony",
+              "monitor video sony",
+              "sony trinitron profesional",
+              "monitor broadcast sony",
+              "monitor crt profesional sony",
+              "commodore 1084",
+              "1084s",
+              "philips cm8833",
+              "cm8833",
+              "monitor amiga",
+              "monitor commodore",
+          ]
 
-          python3 - <<'PY' > /tmp/query.txt
-          import urllib.parse
-          print(urllib.parse.urlencode({
-              'step':1,
-              'source':'keywords',
-              'limit':40,
-              'keywords':'Monitor Sony Triniton profesional Vintage',
-              'min_sale_price':250,
-              'max_sale_price':280,
-              'latitude':41.6488,
-              'longitude':-0.8891,
-              'distance':200000,
-          }))
-          PY
-          QS="$(cat /tmp/query.txt)"
+          base='https://api.wallapop.com/api/v3/search'
+          items_by_id={}
+          raw={}
+          for q in queries:
+              params={'step':1,'source':'keywords','limit':40,'keywords':q}
+              url=base+'?'+urllib.parse.urlencode(params)
+              try:
+                  txt=subprocess.check_output([
+                      'curl','--fail','--silent','--show-error','--location',
+                      '-H','Host: api.wallapop.com','-H','X-DeviceOS: 0',url
+                  ], text=True)
+                  d=json.loads(txt)
+              except Exception as e:
+                  raw[q]={'error':str(e)}
+                  continue
+              raw[q]=d
+              arr=((((d.get('data') or {}).get('section') or {}).get('payload') or {}).get('items') or [])
+              for it in arr:
+                  iid=it.get('id')
+                  if not iid: continue
+                  rec=items_by_id.setdefault(iid,it.copy())
+                  rec.setdefault('_queries',[])
+                  if q not in rec['_queries']: rec['_queries'].append(q)
+              time.sleep(0.05)
 
-          echo "SEARCH_URL=$URL?$QS"
-          curl --show-error --location \
-            -H 'Host: api.wallapop.com' \
-            -H 'X-DeviceOS: 0' \
-            "$URL?$QS" -o out/search.json -w '\nHTTP=%{http_code}\n'
+          def score(it):
+              s=0
+              t=((it.get('title') or '')+' '+(it.get('description') or '')).lower()
+              rules=[
+                (r'\b20l5\b',120),(r'\b20l4\b',115),(r'\b20m4e?\b',110),(r'\b20n6e?\b',95),
+                (r'\b20n5e?\b',75),(r'\b14l4\b',80),(r'\b14m4e?\b',78),(r'\b14n6e?\b',72),
+                (r'\bbvm[- ]?20',105),(r'\bpvm[- ]?20',90),(r'\bpvm[- ]?14',65),
+                (r'\b1084s\b',70),(r'\b1084\b',60),(r'\bcm8833',65),
+                (r'\bpvm\b',35),(r'\bbvm\b',35),(r'profesional',10),(r'broadcast',10),(r'trinitron',5)
+              ]
+              for pat,val in rules:
+                  if re.search(pat,t): s=max(s,val) if val>=60 else s+val
+              price=((it.get('price') or {}).get('amount') or 9999)
+              if s>=90 and price<=700: s+=25
+              if s>=70 and price<=400: s+=15
+              if price<=250: s+=5
+              return s
 
-          echo '--- response head ---'
-          head -c 2000 out/search.json || true
-          echo
-
-          python3 - <<'PY'
-          import json, pathlib, sys
-          p=pathlib.Path('out/search.json')
-          d=json.loads(p.read_text())
-          items = (((d.get('data') or {}).get('section') or {}).get('payload') or {}).get('items') or []
-          print('ITEM_COUNT:', len(items))
-          target=None
+          items=list(items_by_id.values())
           for it in items:
-              print('CANDIDATE:', it.get('id'), it.get('title'), it.get('price'), it.get('location'), it.get('web_slug'))
-              if it.get('web_slug') == 'monitor-sony-vintage-1119238065':
-                  target=it
-                  break
-              title=(it.get('title') or '').lower()
-              if 'triniton' in title and 'profesional' in title and (it.get('price') or {}).get('amount') == 269:
-                  target=it
-          if not target:
-              raise SystemExit('TARGET_NOT_FOUND')
-          pathlib.Path('out/target.json').write_text(json.dumps(target, ensure_ascii=False, indent=2))
-          print('TARGET_ID:', target.get('id'))
-          print('TARGET_TITLE:', target.get('title'))
-          print('TARGET_DESC:', target.get('description'))
-          print('TARGET_PRICE:', target.get('price'))
-          imgs=target.get('images') or []
-          print('IMAGE_COUNT:', len(imgs))
-          urls=[]
-          for n,img in enumerate(imgs,1):
-              u=((img.get('urls') or {}).get('big') or (img.get('urls') or {}).get('medium') or (img.get('urls') or {}).get('small'))
-              print(f'IMAGE_{n}: {u}')
-              if u: urls.append(u)
-          pathlib.Path('out/image_urls.txt').write_text('\n'.join(urls))
+              it['_score']=score(it)
+          items.sort(key=lambda x:(x['_score'], -((x.get('price') or {}).get('amount') or 9999)), reverse=True)
+
+          pathlib.Path('out/results.json').write_text(json.dumps(items,ensure_ascii=False,indent=2))
+          pathlib.Path('out/raw.json').write_text(json.dumps(raw,ensure_ascii=False))
+
+          print("UNIQUE_ITEMS",len(items))
+          for idx,it in enumerate(items[:50],1):
+              print("ROW",idx,
+                    "SCORE",it['_score'],
+                    "PRICE",(it.get('price') or {}).get('amount'),
+                    "CITY",(it.get('location') or {}).get('city'),
+                    "TITLE",it.get('title'),
+                    "SLUG",it.get('web_slug'),
+                    "QUERIES",','.join(it.get('_queries',[])))
+
+          # Download first image for top 30 for visual inspection
+          for idx,it in enumerate(items[:30],1):
+              imgs=it.get('images') or []
+              if not imgs: continue
+              u=((imgs[0].get('urls') or {}).get('big') or (imgs[0].get('urls') or {}).get('medium'))
+              if not u: continue
+              fn=f"out/images/{idx:02d}_{it.get('id')}.jpg"
+              subprocess.run(['curl','--fail','--silent','--show-error','--location',u,'-o',fn],check=False)
+
+          # simple TSV
+          with open('out/results.tsv','w',encoding='utf-8') as fh:
+              fh.write("score\tprice\tcity\ttitle\tslug\tqueries\n")
+              for it in items:
+                  fh.write(f"{it['_score']}\t{(it.get('price') or {}).get('amount')}\t{(it.get('location') or {}).get('city')}\t{(it.get('title') or '').replace(chr(9),' ')}\t{it.get('web_slug')}\t{','.join(it.get('_queries',[]))}\n")
           PY
+          python3 /tmp/sweep.py
+          tar -czf wallapop-crt-sweep.tgz -C out .
 
-          i=1
-          while IFS= read -r url || [ -n "$url" ]; do
-            [ -z "$url" ] && continue
-            echo "Downloading image $i"
-            curl --fail --show-error --location "$url" -o "out/image_$i.jpg"
-            file "out/image_$i.jpg" || true
-            i=$((i+1))
-          done < out/image_urls.txt
-
-          ls -lah out
-          tar -czf wallapop-images.tgz -C out .
-
-      - name: Upload fetched images
+      - name: Upload sweep
         uses: actions/upload-artifact@v4
         with:
-          name: wallapop-images
-          path: wallapop-images.tgz
+          name: wallapop-crt-sweep
+          path: wallapop-crt-sweep.tgz
           if-no-files-found: error
